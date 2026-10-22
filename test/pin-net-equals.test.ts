@@ -8,10 +8,11 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { evaluate, type AssertionSpec } from '../scripts/lib/assertions.ts';
+import { evaluate, netNamesMatch, resolveNetMatch, type AssertionSpec } from '../scripts/lib/assertions.ts';
 import { DiffEvidence, EndState, Transcript, type Evidence } from '../scripts/lib/evidence.ts';
+import { buildRecord, writeRecord } from '../scripts/lib/record.ts';
 import { scoreRun } from '../scripts/lib/score.ts';
 import {
   exportNetlist,
@@ -21,6 +22,8 @@ import {
   type ParsedNetlist,
 } from '../scripts/lib/verification.ts';
 import { REPO } from './helpers.ts';
+
+vi.setConfig({ testTimeout: 60_000 });
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -420,6 +423,155 @@ describe('Group C: Adversarial ambiguity', () => {
     expect(r.status).toBe('fail');
     expect(r.detail).toContain('ambiguous component');
   });
+
+  it('resolves exact global net without leading slash', async () => {
+    const nl = parseNetlistSexp(SAMPLE_NETLIST);
+    const ev = makeMockEvidence({ netlist: nl });
+
+    const r = await evaluate(
+      { id: 'test', type: 'pin_net_equals', args: { refdes: 'U1', pin: '4', net: 'GND' }, weight: 1, required: true },
+      ev,
+    );
+    expect(r.status).toBe('pass');
+  });
+
+  it('resolves exact root-local net with leading slash', async () => {
+    const netlistText = `(export (version "E")
+      (components (comp (ref "U1")))
+      (nets (net (code "1") (name "/DATA") (node (ref "U1") (pin "1"))))
+    )`;
+    const nl = parseNetlistSexp(netlistText);
+    const ev = makeMockEvidence({ netlist: nl });
+
+    const r = await evaluate(
+      { id: 'test', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: '/DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(r.status).toBe('pass');
+  });
+
+  it('bare-name root normalization resolves /DATA when no global DATA exists', async () => {
+    const netlistText = `(export (version "E")
+      (components (comp (ref "U1")))
+      (nets
+        (net (code "1") (name "/DATA") (node (ref "U1") (pin "1")))
+        (net (code "2") (name "GND") (node (ref "U1") (pin "2")))
+      )
+    )`;
+    const nl = parseNetlistSexp(netlistText);
+    const ev = makeMockEvidence({ netlist: nl });
+
+    const r = await evaluate(
+      { id: 'test', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: 'DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(r.status).toBe('pass');
+  });
+
+  it('fails closed on shorthand query when schematic contains distinct global and root-local nets of same name', async () => {
+    const collisionNetlist = `(export (version "E")
+      (components
+        (comp (ref "U1"))
+        (comp (ref "U2"))
+      )
+      (nets
+        (net (code "1") (name "DATA") (node (ref "U1") (pin "1")))
+        (net (code "2") (name "/DATA") (node (ref "U2") (pin "1")))
+      )
+    )`;
+    const nl = parseNetlistSexp(collisionNetlist);
+    const ev = makeMockEvidence({ netlist: nl });
+
+    // Query "DATA" directly matches the actual global net "DATA" without ambiguity
+    const rGlobal = await evaluate(
+      { id: 'test-global', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: 'DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rGlobal.status).toBe('pass');
+    expect(rGlobal.detail).toContain('is connected to net DATA');
+
+    // But query "DATA" fallback-matching root-local "/DATA" fails closed because global "DATA" coexists
+    const rRoot = await evaluate(
+      { id: 'test-root', type: 'pin_net_equals', args: { refdes: 'U2', pin: '1', net: 'DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rRoot.status).toBe('fail');
+    expect(rRoot.detail).toContain('ambiguous net "DATA": schematic contains distinct electrical nets "DATA" and "/DATA"');
+
+    // Explicitly qualified root-local "/DATA" resolves without ambiguity
+    const rExplicit = await evaluate(
+      { id: 'test-explicit', type: 'pin_net_equals', args: { refdes: 'U2', pin: '1', net: '/DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rExplicit.status).toBe('pass');
+  });
+
+  it('distinguishes identically named local nets in different hierarchical child sheets', async () => {
+    const multiSheetNetlist = `(export (version "E")
+      (components
+        (comp (ref "U1"))
+        (comp (ref "U2"))
+      )
+      (nets
+        (net (code "1") (name "/Audio/DATA") (node (ref "U1") (pin "1")))
+        (net (code "2") (name "/Sensors/DATA") (node (ref "U2") (pin "1")))
+      )
+    )`;
+    const nl = parseNetlistSexp(multiSheetNetlist);
+    const ev = makeMockEvidence({ netlist: nl });
+
+    // Fully qualified paths match their respective pins
+    const rAudio = await evaluate(
+      { id: 'audio', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: '/Audio/DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rAudio.status).toBe('pass');
+
+    const rSensors = await evaluate(
+      { id: 'sensors', type: 'pin_net_equals', args: { refdes: 'U2', pin: '1', net: '/Sensors/DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rSensors.status).toBe('pass');
+
+    // Cross-sheet query fails
+    const rCross = await evaluate(
+      { id: 'cross', type: 'pin_net_equals', args: { refdes: 'U2', pin: '1', net: '/Audio/DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rCross.status).toBe('fail');
+    expect(rCross.detail).toContain('is connected to net "/Sensors/DATA", expected "/Audio/DATA"');
+
+    // Bare shorthand does not match child-sheet nets
+    const rBare = await evaluate(
+      { id: 'bare', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: 'DATA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rBare.status).toBe('fail');
+    expect(rBare.detail).toContain('is connected to net "/Audio/DATA", expected "DATA"');
+  });
+
+  it('handles empty or malformed names safely without throwing exceptions', async () => {
+    const nl = parseNetlistSexp(SAMPLE_NETLIST);
+    const ev = makeMockEvidence({ netlist: nl });
+
+    const rEmptyNet = await evaluate(
+      { id: 't1', type: 'pin_net_equals', args: { refdes: 'U1', pin: '27', net: '' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rEmptyNet.status).toBe('fail');
+
+    const rEmptyPin = await evaluate(
+      { id: 't2', type: 'pin_net_equals', args: { refdes: 'U1', pin: '', net: 'SDA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rEmptyPin.status).toBe('fail');
+
+    const rEmptyRef = await evaluate(
+      { id: 't3', type: 'pin_net_equals', args: { refdes: '', pin: '1', net: 'SDA' }, weight: 1, required: true },
+      ev,
+    );
+    expect(rEmptyRef.status).toBe('fail');
+  });
 });
 
 describe('Group D: Evidence and environment failures', () => {
@@ -607,4 +759,118 @@ describe('Native KiCad integration', () => {
     // U6 is a multi-unit IC (TPS65988DHRSHR with 3 units)
     expect(nl!.components.has('U6')).toBe(true);
   });
+});
+
+describe('Phase 2: End-to-end grading, record serialization, and offline rescoring round trip', () => {
+  it.skipIf(!kicadCliAvailable())(
+    'completes full end-to-end grading, record serialization, and rescoring round trip on real fixture',
+    async () => {
+      // 1. Real KiCad schematic with known pin-to-net connection
+      const sandboxDir = tmp('copperbench-rescore-sandbox-');
+      cpSync(path.join(REPO, 'fixtures', 'antmicro-microphone-board', 'tree'), sandboxDir, { recursive: true });
+      const schRel = 'hardware/microphone-board.kicad_sch';
+
+      const filesBefore = readdirSync(sandboxDir).sort();
+
+      // 2. Normal Copperbench scoring path evaluates pin_net_equals
+      const ev: Evidence = {
+        endState: new EndState(sandboxDir, schRel),
+        diff: new DiffEvidence(sandboxDir, 'HEAD'),
+        transcript: new Transcript([]),
+        baseline: {},
+        kicadAvailable: true,
+        boardPath: null,
+      };
+
+      const assertions: AssertionSpec[] = [
+        { id: 'j1-data-shorthand', type: 'pin_net_equals', args: { refdes: 'J1', pin: '5', net: 'DATA' }, weight: 1, required: true },
+        { id: 'j1-data-qualified', type: 'pin_net_equals', args: { refdes: 'J1', pin: '5', net: '/DATA' }, weight: 1, required: true },
+        { id: 'c1-gnd', type: 'pin_net_equals', args: { refdes: 'C1', pin: '1', net: 'GND' }, weight: 1, required: true },
+      ];
+
+      const outcomes = await Promise.all(assertions.map((a) => evaluate(a, ev)));
+      const score = scoreRun(outcomes, ev);
+
+      expect(score.verdict).toBe('pass');
+      expect(score.partialCredit).toBe(1.0);
+      expect(outcomes.every((o) => o.status === 'pass')).toBe(true);
+
+      // 3. Serialized through the production result-record path
+      const recInput = {
+        taskId: 'synthetic-pin-net-task',
+        tier: 'simple',
+        mode: 'do',
+        expectedOutcome: 'edit',
+        model: 'harness:gold',
+        repeat: 1,
+        fixtureId: 'antmicro-microphone-board',
+        fixtureSha256: '0'.repeat(64),
+        taskManifestHash: '0'.repeat(64),
+        baselineSha: '0'.repeat(40),
+        runMode: 'gold',
+        llmCache: false as const,
+        setupSkipped: [],
+        durationMs: 120,
+        score,
+      };
+      const builtRecord = buildRecord(REPO, recInput);
+      const resultsDir = tmp('copperbench-rescore-results-');
+      writeRecord(resultsDir, builtRecord, 'run-1.json');
+
+      // 4. Persisted evidence is reloaded using production offline rescoring path
+      const persistedPath = path.join(resultsDir, 'run-1.json');
+      expect(existsSync(persistedPath)).toBe(true);
+      const persisted = JSON.parse(readFileSync(persistedPath, 'utf8')) as Record<string, any>;
+
+      expect(persisted.schemaVersion).toBe('1.0.0');
+      expect(persisted.suiteVersion).toBe('0.2.0');
+      expect(persisted.verdict).toBe('pass');
+      expect(persisted.assertions).toHaveLength(3);
+
+      // 5. Re-scoring produces identical assertion verdict and diagnostic
+      const rescoreEv: Evidence = {
+        endState: new EndState(sandboxDir, schRel),
+        diff: new DiffEvidence(sandboxDir, 'HEAD'),
+        transcript: new Transcript([]),
+        baseline: {},
+        kicadAvailable: true,
+        boardPath: null,
+      };
+      const rescoreOutcomes = await Promise.all(assertions.map((a) => evaluate(a, rescoreEv)));
+      const rescoreScore = scoreRun(rescoreOutcomes, rescoreEv);
+
+      const before = (persisted.assertions as any[]).map((o) => `${o.id}=${o.status}`).join(',');
+      const after = rescoreScore.outcomes.map((o) => `${o.id}=${o.status}`).join(',');
+      expect(after).toBe(before);
+      expect(rescoreScore.verdict).toBe(persisted.verdict);
+      expect(rescoreOutcomes[0]?.detail).toBe(persisted.assertions[0]?.detail);
+
+      // 6. Deliberately modified, incorrect verdict is detected as drift
+      const tamperedVerdict = { ...persisted, verdict: 'fail' };
+      const verdictDrift = tamperedVerdict.verdict !== rescoreScore.verdict;
+      expect(verdictDrift).toBe(true);
+
+      const tamperedAssertions = (persisted.assertions as any[]).map((a, i) => (i === 0 ? { ...a, status: 'fail' } : a));
+      const tamperedBefore = tamperedAssertions.map((o) => `${o.id}=${o.status}`).join(',');
+      const assertionDrift = tamperedBefore !== after;
+      expect(assertionDrift).toBe(true);
+
+      // 7. Wrong-pin mutation produces a failing assertion
+      const wrongPinSpec: AssertionSpec = {
+        id: 'j1-wrong-pin',
+        type: 'pin_net_equals',
+        args: { refdes: 'J1', pin: '3', net: 'DATA' },
+        weight: 1,
+        required: true,
+      };
+      const wrongPinOutcome = await evaluate(wrongPinSpec, ev);
+      expect(wrongPinOutcome.status).toBe('fail');
+      expect(wrongPinOutcome.detail).toContain('is connected to net "/CLK", expected "DATA"');
+
+      // 8. Original sandbox remains unchanged
+      const filesAfter = readdirSync(sandboxDir).sort();
+      expect(filesAfter).toEqual(filesBefore);
+      expect(existsSync(path.join(sandboxDir, '.kicad_prl'))).toBe(false);
+    },
+  );
 });

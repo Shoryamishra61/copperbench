@@ -127,16 +127,46 @@ const symbolAbsent: Handler = async (args, ev) => {
 /**
  * Check whether the net observed in the netlist matches the expected net name.
  * KiCad prefixes root-level local nets with '/' (e.g. '/DATA'), while global nets
- * and power symbols lack leading slashes (e.g. 'GND', '+3V3'). If expectedNet does
- * not start with '/', we allow matching root-level `/${expectedNet}`. Sub-sheet
- * hierarchical nets (e.g. '/Audio/SDA') require the full path and never match 'SDA'.
+ * and power symbols lack leading slashes (e.g. 'GND', '+3V3').
+ *
+ * Exact matches always succeed: an assertion querying 'DATA' connects to an actual
+ * global 'DATA' net directly, even if a root-local '/DATA' net coexists.
+ *
+ * Root-level fallback normalization (expectedNet 'DATA' matching actualNet '/DATA')
+ * is allowed ONLY when no distinct global net 'DATA' exists in the design.
+ * If both a global net 'DATA' and a root-local net '/DATA' coexist, resolving shorthand
+ * 'DATA' to the root-local '/DATA' net is ambiguous and fails closed.
+ * Sub-sheet hierarchical nets (e.g. '/Audio/SDA') require the full path and never match 'SDA'.
  */
-function netNamesMatch(actualNet: string, expectedNet: string): boolean {
-  if (actualNet === expectedNet) return true;
-  if (!expectedNet.startsWith('/') && actualNet === '/' + expectedNet) {
-    return true;
+export function resolveNetMatch(
+  actualNet: string,
+  expectedNet: string,
+  knownNets: string[] | Set<string>,
+): { matches: boolean; ambiguous?: boolean } {
+  // 1. Exact match always succeeds (global nets like 'DATA', root-local with slash '/DATA', etc.)
+  if (actualNet === expectedNet) {
+    return { matches: true };
   }
-  return false;
+
+  // 2. Root-level shorthand fallback: query "DATA" matching actual "/DATA"
+  if (!expectedNet.startsWith('/') && actualNet === '/' + expectedNet) {
+    const netsSet = Array.isArray(knownNets) ? new Set(knownNets) : knownNets;
+    // If a distinct global net exists with the same name, fallback is ambiguous
+    if (netsSet.has(expectedNet)) {
+      return { matches: false, ambiguous: true };
+    }
+    return { matches: true };
+  }
+
+  return { matches: false };
+}
+
+export function netNamesMatch(
+  actualNet: string,
+  expectedNet: string,
+  knownNets?: string[] | Set<string>,
+): boolean {
+  return resolveNetMatch(actualNet, expectedNet, knownNets ?? [actualNet]).matches;
 }
 
 const pinNetEquals: Handler = async (args, ev) => {
@@ -177,7 +207,12 @@ const pinNetEquals: Handler = async (args, ev) => {
     return fail(`pin ${pin} of component ${refdes} is not connected to any net (disconnected)`);
   }
 
-  if (!netNamesMatch(actualNet, expectedNet)) {
+  const match = resolveNetMatch(actualNet, expectedNet, netlist.nets);
+  if (match.ambiguous) {
+    return fail(`ambiguous net "${expectedNet}": schematic contains distinct electrical nets "${expectedNet}" and "/${expectedNet}"`);
+  }
+
+  if (!match.matches) {
     return fail(`pin ${pin} of ${refdes} is connected to net "${actualNet}", expected "${expectedNet}"`);
   }
 
