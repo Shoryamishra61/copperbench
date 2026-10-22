@@ -124,6 +124,66 @@ const symbolAbsent: Handler = async (args, ev) => {
     : pass(`symbol ${args['refdes']} is absent`);
 };
 
+/**
+ * Check whether the net observed in the netlist matches the expected net name.
+ * KiCad prefixes root-level local nets with '/' (e.g. '/DATA'), while global nets
+ * and power symbols lack leading slashes (e.g. 'GND', '+3V3'). If expectedNet does
+ * not start with '/', we allow matching root-level `/${expectedNet}`. Sub-sheet
+ * hierarchical nets (e.g. '/Audio/SDA') require the full path and never match 'SDA'.
+ */
+function netNamesMatch(actualNet: string, expectedNet: string): boolean {
+  if (actualNet === expectedNet) return true;
+  if (!expectedNet.startsWith('/') && actualNet === '/' + expectedNet) {
+    return true;
+  }
+  return false;
+}
+
+const pinNetEquals: Handler = async (args, ev) => {
+  const refdes = String(args['refdes'] ?? '');
+  const pin = String(args['pin'] ?? '');
+  const expectedNet = String(args['net'] ?? '');
+
+  if (!ev.kicadAvailable && ev.netlist === undefined) {
+    return unevaluable('pin_net_equals requires kicad-cli, which was not available in this environment');
+  }
+
+  const netlist = ev.netlist ?? (await ev.endState.netlist(ev.kicadAvailable));
+  if (!netlist) {
+    return fail('schematic could not be netlisted by kicad-cli; the file may be unloadable or invalid');
+  }
+
+  if (netlist.duplicateRefdes.has(refdes)) {
+    return fail(`ambiguous component: multiple components in schematic share reference "${refdes}"`);
+  }
+
+  if (!netlist.components.has(refdes)) {
+    return fail(`component ${refdes} not found in schematic`);
+  }
+
+  const pins = netlist.componentPins.get(refdes);
+  if (!pins || !pins.has(pin)) {
+    return fail(`pin ${pin} not found on component ${refdes}`);
+  }
+
+  const key = `${refdes}:${pin}`;
+  if (netlist.ambiguousPins.has(key)) {
+    const nets = netlist.ambiguousPins.get(key)!.join(', ');
+    return fail(`ambiguous connectivity: pin ${pin} of ${refdes} appears on multiple distinct nets [${nets}]`);
+  }
+
+  const actualNet = netlist.pinToNet.get(key);
+  if (!actualNet) {
+    return fail(`pin ${pin} of component ${refdes} is not connected to any net (disconnected)`);
+  }
+
+  if (!netNamesMatch(actualNet, expectedNet)) {
+    return fail(`pin ${pin} of ${refdes} is connected to net "${actualNet}", expected "${expectedNet}"`);
+  }
+
+  return pass(`pin ${pin} of ${refdes} is connected to net ${expectedNet}`);
+};
+
 const docContains: Handler = async (args, ev) => {
   const body = ev.endState.doc(args['doc']);
   if (body === undefined) return fail(`document ${args['doc']} not found`);
@@ -286,7 +346,7 @@ export const HANDLERS: Readonly<Record<string, Handler>> = {
   net_absent: netAbsent,
   symbol_present: symbolPresent,
   symbol_absent: symbolAbsent,
-  pin_net_equals: async () => unevaluable('pin_net_equals evaluation is not implemented yet'),
+  pin_net_equals: pinNetEquals,
   doc_row_matches: async () => unevaluable('doc_row_matches evaluation is not implemented yet'),
   doc_contains: docContains,
   constraint_registered: constraintRegistered,

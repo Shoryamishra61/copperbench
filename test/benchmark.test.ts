@@ -6,7 +6,7 @@
 // fine and mean nothing.
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -25,7 +25,16 @@ vi.setConfig({ testTimeout: 120_000 });
 
 const tmps: string[] = [];
 afterEach(() => {
-  while (tmps.length > 0) rmSync(tmps.pop() as string, { recursive: true, force: true });
+  while (tmps.length > 0) {
+    const d = tmps.pop();
+    if (d && existsSync(d)) {
+      try {
+        rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        // ignore transient directory locks on Windows
+      }
+    }
+  }
 });
 
 function tmp(): string {
@@ -36,7 +45,8 @@ function tmp(): string {
 
 function runCli(args: string[]): { code: number; out: string } {
   try {
-    const out = execFileSync('npx', ['tsx', 'scripts/benchmark.ts', ...args], {
+    const tsxCli = path.join(REPO, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const out = execFileSync(process.execPath, [tsxCli, 'scripts/benchmark.ts', ...args], {
       cwd: REPO,
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
@@ -175,6 +185,42 @@ describe('the closed vocabulary is structural', () => {
     }
     expect(types.length).toBeGreaterThan(15);
   });
+
+  it('evaluates pin_net_equals as unevaluable when kicad-cli is missing', async () => {
+    const outcome = await evaluate(
+      { id: 'pne', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: 'GND' }, weight: 1, required: true },
+      fakeEvidence(),
+    );
+    expect(outcome.status).toBe('unevaluable');
+    expect(outcome.detail).toContain('kicad-cli');
+    expect(outcome.detail).toContain('not available');
+  });
+
+  it('evaluates pin_net_equals deterministically with netlist evidence', async () => {
+    const ev: Evidence = {
+      ...fakeEvidence(),
+      kicadAvailable: true,
+      netlist: {
+        components: new Set(['U1']),
+        componentPins: new Map([['U1', new Set(['1', '2'])]]),
+        pinToNet: new Map([['U1:1', 'GND'], ['U1:2', 'VCC']]),
+        ambiguousPins: new Map(),
+        duplicateRefdes: new Set(),
+        nets: ['GND', 'VCC'],
+      },
+    };
+    const passOutcome = await evaluate(
+      { id: 'pne-pass', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: 'GND' }, weight: 1, required: true },
+      ev,
+    );
+    expect(passOutcome.status).toBe('pass');
+
+    const failOutcome = await evaluate(
+      { id: 'pne-fail', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: 'VCC' }, weight: 1, required: true },
+      ev,
+    );
+    expect(failOutcome.status).toBe('fail');
+  });
 });
 
 describe('record writing', () => {
@@ -258,7 +304,12 @@ describe('re-scoring', () => {
     const results = tmp();
     runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
     const r = runCli(['--rescore', results]);
-    expect(r.out).toContain('1 re-scored, 0 not comparable, 0 drift(s)');
+    if (kicadCliAvailable()) {
+      expect(r.out).toContain('1 re-scored, 0 not comparable, 0 drift(s)');
+    } else {
+      expect(r.out).toContain('0 re-scored, 1 not comparable, 0 drift(s)');
+      expect(r.out).toContain('setup was skipped');
+    }
     expect(r.code).toBe(0);
   });
 
@@ -276,6 +327,20 @@ describe('re-scoring', () => {
     expect(r.out).toContain('0 re-scored, 1 not comparable, 0 drift(s)');
     expect(r.out).toContain('SKIP');
     expect(r.code).toBe(0);
+  });
+
+  it('detects drift when a recorded verdict disagrees with re-scored evaluation', () => {
+    const results = tmp();
+    runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    const date = new Date().toISOString().slice(0, 10);
+    const file = path.join(results, date, 'harness-gold', 'do-budget-refusal-pullup', 'run-1.json');
+    const rec = JSON.parse(readFileSync(file, 'utf8')) as { verdict: string };
+    rec.verdict = 'fail';
+    writeFileSync(file, `${JSON.stringify(rec, null, 2)}\n`);
+    const r = runCli(['--rescore', results]);
+    expect(r.out).toContain('DRIFT');
+    expect(r.out).toContain('1 drift(s)');
+    expect(r.code).toBe(1);
   });
 });
 
