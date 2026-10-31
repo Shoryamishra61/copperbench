@@ -149,7 +149,7 @@ export function resolveNetMatch(
   }
 
   // 2. Root-level shorthand fallback: query "DATA" matching actual "/DATA"
-  if (!expectedNet.startsWith('/') && actualNet === '/' + expectedNet) {
+  if (expectedNet.length > 0 && !expectedNet.startsWith('/') && actualNet === '/' + expectedNet) {
     const netsSet = Array.isArray(knownNets) ? new Set(knownNets) : knownNets;
     // If a distinct global net exists with the same name, fallback is ambiguous
     if (netsSet.has(expectedNet)) {

@@ -571,6 +571,19 @@ describe('Group C: Adversarial ambiguity', () => {
       ev,
     );
     expect(rEmptyRef.status).toBe('fail');
+
+    // Empty net query must never match root net "/"
+    const rootNetlist = `(export (version "E")
+      (components (comp (ref "U1")))
+      (nets (net (code "1") (name "/") (node (ref "U1") (pin "1"))))
+    )`;
+    const nlRoot = parseNetlistSexp(rootNetlist);
+    const evRoot = makeMockEvidence({ netlist: nlRoot });
+    const rEmptyAgainstSlash = await evaluate(
+      { id: 't4', type: 'pin_net_equals', args: { refdes: 'U1', pin: '1', net: '' }, weight: 1, required: true },
+      evRoot,
+    );
+    expect(rEmptyAgainstSlash.status).toBe('fail');
   });
 });
 
@@ -692,6 +705,42 @@ describe('Real schematic pin extraction', () => {
     expect(schInfo.componentPins.has('R1')).toBe(true);
     expect(schInfo.componentPins.get('R1')?.has('1')).toBe(true);
     expect(schInfo.componentPins.get('R1')?.has('2')).toBe(true);
+  });
+
+  it('resolves multi-level symbol inheritance (C extends B extends A) and order-independent pin definitions', () => {
+    const dir = tmp('copperbench-sch-inherit-');
+    const schPath = path.join(dir, 'test.kicad_sch');
+    // Notice: symbol instance U1 appears BEFORE its lib_symbols definition in the sexp,
+    // and symbol inheritance has C extending B, which extends A
+    const schContent = `(kicad_sch (version 20231120) (generator eeschema)
+      (symbol
+        (lib_id "Lib:DerivedC")
+        (at 100 100 0)
+        (unit 1)
+        (property "Reference" "U1")
+      )
+      (lib_symbols
+        (symbol "Lib:DerivedC"
+          (extends "Lib:DerivedB")
+          (symbol "DerivedC_1_1" (pin input line (number "3")))
+        )
+        (symbol "Lib:DerivedB"
+          (extends "Lib:BaseA")
+          (symbol "DerivedB_1_1" (pin input line (number "2")))
+        )
+        (symbol "Lib:BaseA"
+          (symbol "BaseA_1_1" (pin input line (number "1")))
+        )
+      )
+    )`;
+    writeFileSync(schPath, schContent);
+
+    const schInfo = extractSchematicPins(schPath);
+    expect(schInfo.componentPins.has('U1')).toBe(true);
+    const u1Pins = schInfo.componentPins.get('U1')!;
+    expect(u1Pins.has('1')).toBe(true); // From BaseA
+    expect(u1Pins.has('2')).toBe(true); // From DerivedB
+    expect(u1Pins.has('3')).toBe(true); // From DerivedC
   });
 });
 

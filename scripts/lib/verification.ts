@@ -374,21 +374,35 @@ export function extractSchematicPins(rootSch: string): {
 
   walkSheet(rootSch);
 
-  // Resolve symbol inheritance for pin definitions
-  for (const [derived, base] of symbolExtensions) {
-    const basePins = pinDefs.get(base);
-    if (basePins) {
-      const derivedPins = pinDefs.get(derived) ?? new Set<string>();
-      for (const p of basePins) derivedPins.add(p);
-      pinDefs.set(derived, derivedPins);
-      // Also update any component using the derived symbol
-      for (const [ref, inst] of seenInstances) {
-        if (inst.libId === derived) {
-          const compPins = componentPins.get(ref) ?? new Set<string>();
-          for (const p of basePins) compPins.add(p);
-          componentPins.set(ref, compPins);
+  // Resolve symbol inheritance for pin definitions (multi-level inheritance support)
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [derived, base] of symbolExtensions) {
+      const basePins = pinDefs.get(base);
+      if (basePins) {
+        let derivedPins = pinDefs.get(derived);
+        if (!derivedPins) {
+          derivedPins = new Set<string>();
+          pinDefs.set(derived, derivedPins);
+        }
+        for (const p of basePins) {
+          if (!derivedPins.has(p)) {
+            derivedPins.add(p);
+            changed = true;
+          }
         }
       }
+    }
+  }
+
+  // Populate component pins for all instances from fully resolved pin definitions
+  for (const [ref, inst] of seenInstances) {
+    const defPins = pinDefs.get(inst.libId);
+    if (defPins) {
+      const compPins = componentPins.get(ref) ?? new Set<string>();
+      for (const p of defPins) compPins.add(p);
+      componentPins.set(ref, compPins);
     }
   }
 

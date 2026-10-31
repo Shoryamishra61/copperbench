@@ -5,12 +5,15 @@
 // wrong number; those two can be wrong in a way that makes every number look
 // fine and mean nothing.
 
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const execFileAsync = promisify(execFile);
 
 import { evaluate, HANDLERS, type Outcome } from '../scripts/lib/assertions.ts';
 import { kicadCliAvailable, runDrc } from '../scripts/lib/verification.ts';
@@ -43,18 +46,18 @@ function tmp(): string {
   return d;
 }
 
-function runCli(args: string[]): { code: number; out: string } {
+async function runCli(args: string[]): Promise<{ code: number; out: string }> {
   try {
     const tsxCli = path.join(REPO, 'node_modules', 'tsx', 'dist', 'cli.mjs');
-    const out = execFileSync(process.execPath, [tsxCli, 'scripts/benchmark.ts', ...args], {
+    const { stdout, stderr } = await execFileAsync(process.execPath, [tsxCli, 'scripts/benchmark.ts', ...args], {
       cwd: REPO,
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
     });
-    return { code: 0, out };
+    return { code: 0, out: `${stdout}${stderr}` };
   } catch (e) {
-    const err = e as { status?: number; stdout?: string; stderr?: string };
-    return { code: err.status ?? 1, out: `${err.stdout ?? ''}${err.stderr ?? ''}` };
+    const err = e as { status?: number; code?: number; stdout?: string; stderr?: string };
+    return { code: err.status ?? err.code ?? 1, out: `${err.stdout ?? ''}${err.stderr ?? ''}` };
   }
 }
 
@@ -63,37 +66,37 @@ describe('the two-sided invariant', () => {
   // anything. An assertion set that fails on a correct solution is not gradable.
   // Both halves have to hold or the task is not a task.
 
-  it('gold passes the refusal task', () => {
+  it('gold passes the refusal task', async () => {
     const results = tmp();
-    const r = runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    const r = await runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
     expect(r.out).toContain('PASS  do-budget-refusal-pullup');
     expect(r.code).toBe(0);
   });
 
-  it('noop fails the refusal task', () => {
+  it('noop fails the refusal task', async () => {
     const results = tmp();
-    const r = runCli(['--mode', 'noop', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    const r = await runCli(['--mode', 'noop', '--task', 'do-budget-refusal-pullup', '--results', results]);
     expect(r.out).toContain('FAIL  do-budget-refusal-pullup');
     expect(r.out).toContain('wrong-target');
     expect(r.code).toBe(1);
   });
 
-  it('noop fails the edit task on the assertion that catches doing nothing', () => {
+  it('noop fails the edit task on the assertion that catches doing nothing', async () => {
     const results = tmp();
-    const r = runCli(['--mode', 'noop', '--task', 'do-rename-net', '--results', results]);
+    const r = await runCli(['--mode', 'noop', '--task', 'do-rename-net', '--results', results]);
     expect(r.out).toContain('FAIL new-net-exists');
     expect(r.code).toBe(1);
   });
 });
 
 describe('unevaluable never becomes pass', () => {
-  it('gold passes the edit task with kicad-cli, and is unscoreable without it', () => {
+  it('gold passes the edit task with kicad-cli, and is unscoreable without it', async () => {
     // Both branches are load-bearing. With kicad-cli the reference solution
     // must PASS, or the task is not gradable (the positive half of the
     // two-sided invariant). Without it the two verification assertions are
     // unevaluable and the run is unscoreable; a PASS there would be a lie.
     const results = tmp();
-    const r = runCli(['--mode', 'gold', '--task', 'do-rename-net', '--results', results]);
+    const r = await runCli(['--mode', 'gold', '--task', 'do-rename-net', '--results', results]);
     if (kicadCliAvailable()) {
       expect(r.out).toContain('PASS  do-rename-net');
       expect(r.code).toBe(0);
@@ -263,12 +266,12 @@ describe('record writing', () => {
     expect(() => writeRecord(dir, missingStamp, 's.json')).toThrow(RecordSchemaError);
   });
 
-  it('gives a second run on the same day the next run number', () => {
+  it('gives a second run on the same day the next run number', async () => {
     // Records are append-only, so the second run of a day must land beside
     // the first rather than collide with it and abort the matrix.
     const results = tmp();
-    const first = runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
-    const second = runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    const first = await runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    const second = await runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
     expect(first.code).toBe(0);
     expect(second.code).toBe(0);
     const date = new Date().toISOString().slice(0, 10);
@@ -300,10 +303,10 @@ describe('record writing', () => {
 });
 
 describe('re-scoring', () => {
-  it('reproduces recorded verdicts with no provider and no network', () => {
+  it('reproduces recorded verdicts with no provider and no network', async () => {
     const results = tmp();
-    runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
-    const r = runCli(['--rescore', results]);
+    await runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    const r = await runCli(['--rescore', results]);
     if (kicadCliAvailable()) {
       expect(r.out).toContain('1 re-scored, 0 not comparable, 0 drift(s)');
     } else {
@@ -313,31 +316,31 @@ describe('re-scoring', () => {
     expect(r.code).toBe(0);
   });
 
-  it('segregates a record from another kicad-cli environment instead of calling it drift', () => {
+  it('segregates a record from another kicad-cli environment instead of calling it drift', async () => {
     // The comparability stamp exists so an environment difference is never
     // reported as a failed reproduction (STANDARD.md section 9).
     const results = tmp();
-    runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    await runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
     const date = new Date().toISOString().slice(0, 10);
     const file = path.join(results, date, 'harness-gold', 'do-budget-refusal-pullup', 'run-1.json');
     const rec = JSON.parse(readFileSync(file, 'utf8')) as { comparability: { kicadCliVersion: string | null } };
     rec.comparability.kicadCliVersion = rec.comparability.kicadCliVersion === null ? '7.0.0' : null;
     writeFileSync(file, `${JSON.stringify(rec, null, 2)}\n`);
-    const r = runCli(['--rescore', results]);
+    const r = await runCli(['--rescore', results]);
     expect(r.out).toContain('0 re-scored, 1 not comparable, 0 drift(s)');
     expect(r.out).toContain('SKIP');
     expect(r.code).toBe(0);
   });
 
-  it('detects drift when a recorded verdict disagrees with re-scored evaluation', () => {
+  it('detects drift when a recorded verdict disagrees with re-scored evaluation', async () => {
     const results = tmp();
-    runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
+    await runCli(['--mode', 'gold', '--task', 'do-budget-refusal-pullup', '--results', results]);
     const date = new Date().toISOString().slice(0, 10);
     const file = path.join(results, date, 'harness-gold', 'do-budget-refusal-pullup', 'run-1.json');
     const rec = JSON.parse(readFileSync(file, 'utf8')) as { verdict: string };
     rec.verdict = 'fail';
     writeFileSync(file, `${JSON.stringify(rec, null, 2)}\n`);
-    const r = runCli(['--rescore', results]);
+    const r = await runCli(['--rescore', results]);
     expect(r.out).toContain('DRIFT');
     expect(r.out).toContain('1 drift(s)');
     expect(r.code).toBe(1);
@@ -345,14 +348,14 @@ describe('re-scoring', () => {
 });
 
 describe('the runner refuses what it cannot honestly do', () => {
-  it('does not pretend to run an agent without a provider', () => {
-    const r = runCli(['--mode', 'agent']);
+  it('does not pretend to run an agent without a provider', async () => {
+    const r = await runCli(['--mode', 'agent']);
     expect(r.out).toContain('not implemented');
     expect(r.code).toBe(2);
   });
 
-  it('prints a plan and spends nothing on --dry-run', () => {
-    const r = runCli(['--mode', 'noop', '--dry-run']);
+  it('prints a plan and spends nothing on --dry-run', async () => {
+    const r = await runCli(['--mode', 'noop', '--dry-run']);
     expect(r.out).toContain('estimated provider cost: $0.00');
     expect(r.code).toBe(0);
   });
